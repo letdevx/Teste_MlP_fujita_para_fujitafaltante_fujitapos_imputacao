@@ -18,7 +18,7 @@ Este documento estabelece as regras mandatórias para qualquer agente de IA oper
 
 | Ecossistema | Pacote Oficial | Origem / Repositório | Referência de Documentação |
 | :--- | :--- | :--- | :--- |
-| **Python** | `sweep` (v2.1+) | [PyPI - sweep](https://pypi.org/project/sweep/) | [GitHub - diogomachado-bioinfo/sweep](https://github.com/diogomachado-bioinfo/sweep) |
+| **Python** | `sweep` (v2.2.0+) | [GitHub Release - sweep v2.2.0](https://github.com/rasert/sweep/releases) • [PyPI - sweep](https://pypi.org/project/sweep/) | Suporte oficial a FASTA, scRNA-seq e aceleração por GPU (CUDA / CuPy) |
 | **R** | `rSWeeP` (v1.8+) | [Bioconductor - rSWeeP](https://bioconductor.org/packages/rSWeeP) | [GitHub - CamilaPPerico/rSWeeP](https://github.com/CamilaPPerico/rSWeeP) • [Docs AIBIA Lab](https://aibialab.github.io/rSWeeP) |
 
 > **Artigo Científico Base:**  
@@ -30,14 +30,14 @@ Este documento estabelece as regras mandatórias para qualquer agente de IA oper
 
 Sempre que uma solicitação de vetorização ou redução dimensional com SWeeP for realizada, o agente deve seguir rigorosamente a seguinte cadeia de decisão:
 
-1. **Prioridade 1 — Pacote Python Oficial (`sweep`):**
+1. **Prioridade 1 — Pacote Python Oficial (`sweep` v2.2.0+) com GPU (CuPy):**
    - Utilizar a biblioteca `sweep` diretamente no ambiente virtual Python gerenciado via `uv`.
-   - Utilizar para vetorização de sequências biológicas em formato FASTA (`fas2sweep`) e geração/auditoria de bases ortonormais estritas via SVD (`orthbase`, `is_orthonormal`).
-   - *Atenção:* A versão atual do pacote Python oficial (2.1+) não implementa redução de dimensionalidade sobre matrizes de contagens/expressão gênica (scRNA-seq). Para dados matriciais celulares, deve-se adotar obrigatoriamente a Prioridade 2.
+   - Utilizar tanto para sequências FASTA quanto para **matrizes de expressão gênica e contagens celulares (scRNA-seq, CSR/CSC)** via função homologada `sweep.sweep(matriz, orthbase=..., device="cuda")`.
+   - Para geração de ortobase determinística com algoritmo analítico de primos e congruência idêntica ao R, utilizar `sweep.orth_base(lin, col, seed=42)`.
+   - A aceleração por GPU via CuPy proporciona velocidade superior a 20x sem necessidade de arquivos intermediários em disco (`.mtx`).
 
-2. **Prioridade 2 — Pacote R Oficial (`rSWeeP` v1.18+) via Subprocesso:**
-   - Para redução dimensional de matrizes de expressão gênica (scRNA-seq, contagens celulares, `dgCMatrix`), utilize a implementação oficial do `rSWeeP` mantida pelo laboratório AIBIA/UFPR.
-   - O agente **não deve** tentar reimplementar a projeção ou aplicar multiplicação matricial solta em Python; deve invocar o script homologado `projetar_rsweep_oficial.R` via `subprocess.run(["Rscript", ...])`, o qual aciona as rotinas oficiais `rSWeeP::orthBase` e `rSWeeP::SWeeP(input, orthbase)`.
+2. **Prioridade 2 — Pacote R Oficial (`rSWeeP` v1.18+) via Subprocesso (CPU / Fallback):**
+   - Para ambientes sem GPU NVIDIA operacional ou auditoria comparativa de referência canônica, o agente pode invocar o script homologado `projetar_rsweep_oficial.R` via `subprocess.run(["Rscript", ...])`.
 
 ---
 
@@ -45,9 +45,9 @@ Sempre que uma solicitação de vetorização ou redução dimensional com SWeeP
 
 Caso as dependências não estejam presentes no ambiente no momento da execução, o agente deve instalá-las imediatamente:
 
-### No Ambiente Python (`uv`):
+### No Ambiente Python (`uv` com suporte a GPU):
 ```bash
-uv add sweep
+uv add "https://github.com/rasert/sweep/releases/download/v2.2.0.0-beta.1/sweep-2.2.0.0-py3-none-any.whl" cupy-cuda12x
 ```
 
 ### No Ambiente R (Bioconductor / GitHub Oficial v1.18+):
@@ -66,10 +66,26 @@ if (!requireNamespace("rSWeeP", quietly = TRUE) || packageVersion("rSWeeP") < "1
 
 ---
 
-## 💻 5. Guia Prático de Implementação (Snippets Oficiais)
+### Padrão 1: Vetorização Matricial Direta na GPU com SWeeP Python (`sweep.sweep`)
+Para matrizes de expressão gênica e contagens celulares (scRNA-seq, CSR esparso):
 
-### Padrão 1: Vetorização de Sequências FASTA e Ortobase com Python (`sweep`)
-Para sequências biológicas FASTA ou geração de bases ortonormais SVD:
+```python
+import sweep
+import numpy as np
+
+# 1. Ortobase canônica analítica determinística (idêntica ao rSWeeP::orthBase)
+orth_res = sweep.orth_base(lin=36601, col=600, seed=42)
+orthbase = orth_res.mat  # float64 com 0.0 de diferença contra o R
+
+# 2. Projeção direta na GPU NVIDIA via CuPy (sem arquivos intermediários .mtx)
+res = sweep.sweep(X_bin, orthbase=orthbase, device="cuda")
+X_projetado = res.proj.astype(np.float32)  # Saída float32 pronta para MLP Keras
+```
+
+---
+
+### Padrão 2: Vetorização de Sequências FASTA e Ortobase SVD
+Para sequências biológicas FASTA ou geração de bases ortonormais via SVD pura:
 
 ```python
 from sweep import fas2sweep, is_orthonormal, orthbase
@@ -78,15 +94,12 @@ import numpy as np
 # A. Geração e verificação de ortobase pura (SVD)
 orth_mat = orthbase(lin=36601, col=600, seed=42, dtype=np.float32)
 assert is_orthonormal(orth_mat.astype(np.float64)), "Base gerada não é estritamente ortonormal!"
-
-# B. Vetorização oficial de sequências FASTA (aminoácidos ou nucleotídeos)
-# vetores_compactos = fas2sweep("sequencias.fasta", orth_mat=orth_mat)
 ```
 
 ---
 
-### Padrão 2: Execução do `rSWeeP` em R via Subprocesso Python
-Para matrizes de contagens celulares e scRNA-seq, utilize o script homologado `projetar_rsweep_oficial.R`:
+### Padrão 3: Execução de Referência Legada (rSWeeP em R / CPU Fallback)
+Caso necessite de auditoria comparativa formal contra a implementação legada em R:
 
 ```python
 import subprocess
