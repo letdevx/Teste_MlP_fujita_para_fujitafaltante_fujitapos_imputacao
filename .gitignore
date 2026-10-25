@@ -4,5 +4,6 @@ dados/*
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+outputs_kt_*/
 
 Teste_MlP_fujita_para_fujitafaltante_fujitapos_imputacao.code-workspace
