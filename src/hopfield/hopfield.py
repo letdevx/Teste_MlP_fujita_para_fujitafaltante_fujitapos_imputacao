@@ -525,6 +525,8 @@ class ModernHopfieldNetwork(nn.Module):
         )
         return self
 
+    save = salvar
+
     @classmethod
     def carregar(
         cls, path: PathType, device: str | torch.device | None = None
@@ -560,6 +562,8 @@ class ModernHopfieldNetwork(nn.Module):
             f"({rede.patterns.shape[0]} padrões, device={rede.device.type})"
         )
         return rede
+
+    load = carregar
 
     def salvar_com_metadados(
         self,
