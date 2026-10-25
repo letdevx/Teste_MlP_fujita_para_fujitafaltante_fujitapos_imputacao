@@ -329,11 +329,17 @@ def anexar_secao_pos_hopfield_notebook(
     nome_cenario: str,
     is_cross_dataset: bool,
     path_json_saida: str,
+    path_modelo: str,
+    path_scaler: str,
+    path_y: str,
+    path_proj_limpo: str,
+    path_proj_ruido: str,
 ) -> None:
     """Anexa e executa a Seção 8 (Pós-Imputação Hopfield) em um notebook exp0X.ipynb.
 
-    Garante idempotência (substitui caso já anexado) e reusa os modelos .keras,
-    scalers .pkl e relatórios relatorio_limpo e relatorio_ruido das células anteriores.
+    Garante idempotência (substitui caso já anexado) e reusa estritamente os modelos
+    .keras e scalers .pkl da Fase 1, executando de forma autocontida exclusivamente
+    as células da nova seção para preservar 100% dos outputs históricos anteriores.
     """
     import uuid
     import nbformat
@@ -354,6 +360,8 @@ def anexar_secao_pos_hopfield_notebook(
     if idx_corte is not None:
         nb.cells = nb.cells[:idx_corte]
 
+    idx_inicio_novas = len(nb.cells)
+
     # 2. Célula Markdown de introdução da Seção 8
     md_source = f"""# 8. Avaliação Pós-Imputação Hopfield (Reconstrução de Features Ausentes)
 
@@ -372,10 +380,54 @@ Avaliar a capacidade de classificação do modelo **MLP (treinado no baseline li
     # 3. Célula de Código: Inferência e Relatório de Classificação Pós-Hopfield
     if not is_cross_dataset:
         code_infer = f"""# 8.1 Inferência Pós-Hopfield no Conjunto de Teste Holdout (15% Cego) e Dataset Completo
+import os
+import joblib
+import numpy as np
+from pathlib import Path
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.models import load_model
+
+# Garantir execução em CPU para evitar contenção de VRAM
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+if Path.cwd().name == "experimentos":
+    os.chdir(Path.cwd().parent)
+ROOT_DIR = Path.cwd()
+
+DIM_PROJECAO = 600
+CLASSES_VALIDAS = [1, 2, 3, 4, 5, 6, 7]
+NOMES_CLASSES = [f"Classe {{i}}" for i in CLASSES_VALIDAS]
+
+# Carrega modelo e scaler congelados da Fase 1
+modelo = load_model(ROOT_DIR / "{path_modelo}")
+scaler = joblib.load(ROOT_DIR / "{path_scaler}")
+
+# Particionamento canônico idêntico (SEED = 42)
+y_ref = np.load(ROOT_DIR / "{path_y}")
+indices = np.arange(len(y_ref))
+idx_treino_val, idx_teste = train_test_split(
+    indices, test_size=0.15, random_state=42, stratify=y_ref
+)
+
+# Carrega matrizes projetadas 600D
+X_limpo_600d = np.load(ROOT_DIR / "{path_proj_limpo}").astype(np.float32)
+X_ruido_600d = np.load(ROOT_DIR / "{path_proj_ruido}").astype(np.float32)
 X_pos_hopfield = np.load(ROOT_DIR / "{path_proj_pos_hopfield}").astype(np.float32)
+
 assert X_pos_hopfield.shape == (len(y_ref), DIM_PROJECAO), f"Shape inválido: {{X_pos_hopfield.shape}}"
 
-# Escalonamento usando estritamente o scaler do treino limpo
+# Avalia Baseline Limpo no Teste Holdout
+X_teste_limpo_s = scaler.transform(X_limpo_600d[idx_teste])
+y_pred_limpo = np.argmax(modelo.predict(X_teste_limpo_s, verbose=0), axis=1)
+relatorio_limpo = classification_report(y_ref[idx_teste], y_pred_limpo, target_names=NOMES_CLASSES, output_dict=True)
+
+# Avalia Cenário com Ruído 0,5 no Teste Holdout
+X_teste_ruido_s = scaler.transform(X_ruido_600d[idx_teste])
+y_pred_ruido = np.argmax(modelo.predict(X_teste_ruido_s, verbose=0), axis=1)
+relatorio_ruido = classification_report(y_ref[idx_teste], y_pred_ruido, target_names=NOMES_CLASSES, output_dict=True)
+
+# Avalia Cenário Pós-Hopfield no Teste Holdout
 X_teste_hop_s = scaler.transform(X_pos_hopfield[idx_teste])
 X_full_hop_s = scaler.transform(X_pos_hopfield)
 
@@ -398,12 +450,47 @@ print(f"Acurácia no Dataset Completo (100%) Pós-Hopfield: {{acc_full_hop:.4f}}
 """
     else:
         code_infer = f"""# 8.1 Inferência Pós-Hopfield no Dataset Alvo Completo
+import os
+import joblib
+import numpy as np
+from pathlib import Path
+from sklearn.metrics import accuracy_score, classification_report
+from tensorflow.keras.models import load_model
+
+# Garantir execução em CPU para evitar contenção de VRAM
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+if Path.cwd().name == "experimentos":
+    os.chdir(Path.cwd().parent)
+ROOT_DIR = Path.cwd()
+
+DIM_PROJECAO = 600
+CLASSES_VALIDAS = [1, 2, 3, 4, 5, 6, 7]
+NOMES_CLASSES = [f"Classe {{i}}" for i in CLASSES_VALIDAS]
+
+# Carrega modelo e scaler congelados da Fase 1
+modelo = load_model(ROOT_DIR / "{path_modelo}")
+scaler = joblib.load(ROOT_DIR / "{path_scaler}")
+
+y_alvo = np.load(ROOT_DIR / "{path_y}")
+X_limpo_600d = np.load(ROOT_DIR / "{path_proj_limpo}").astype(np.float32)
+X_ruido_600d = np.load(ROOT_DIR / "{path_proj_ruido}").astype(np.float32)
 X_pos_hopfield = np.load(ROOT_DIR / "{path_proj_pos_hopfield}").astype(np.float32)
+
 assert X_pos_hopfield.shape == (len(y_alvo), DIM_PROJECAO), f"Shape inválido: {{X_pos_hopfield.shape}}"
 
-# Escalonamento usando estritamente o scaler da referência limpa
-X_alvo_hop_s = scaler.transform(X_pos_hopfield)
+# Avalia Baseline Limpo no Alvo
+X_alvo_limpo_s = scaler.transform(X_limpo_600d)
+y_pred_limpo = np.argmax(modelo.predict(X_alvo_limpo_s, verbose=0), axis=1)
+relatorio_limpo = classification_report(y_alvo, y_pred_limpo, target_names=NOMES_CLASSES, output_dict=True)
 
+# Avalia Cenário com Ruído 0,5 no Alvo
+X_alvo_ruido_s = scaler.transform(X_ruido_600d)
+y_pred_ruido = np.argmax(modelo.predict(X_alvo_ruido_s, verbose=0), axis=1)
+relatorio_ruido = classification_report(y_alvo, y_pred_ruido, target_names=NOMES_CLASSES, output_dict=True)
+
+# Avalia Cenário Pós-Hopfield no Alvo
+X_alvo_hop_s = scaler.transform(X_pos_hopfield)
 probs_alvo_hop = modelo.predict(X_alvo_hop_s, verbose=0)
 y_pred_alvo_hop = np.argmax(probs_alvo_hop, axis=1)
 
@@ -424,6 +511,30 @@ print(classification_report(y_alvo, y_pred_alvo_hop, target_names=NOMES_CLASSES)
     # 4. Célula de Código: Matriz de Confusão Pós-Hopfield
     if not is_cross_dataset:
         code_cm = f"""# 8.2 Matriz de Confusão Pós-Imputação Hopfield
+import plotly.graph_objects as go
+from sklearn.metrics import confusion_matrix
+
+def plotar_matriz_confusao(y_true, y_pred, titulo):
+    cm = confusion_matrix(y_true, y_pred, labels=np.arange(len(NOMES_CLASSES)))
+    cm_norm = cm.astype(float) / np.maximum(cm.sum(axis=1, keepdims=True), 1e-9)
+    fig = go.Figure(data=go.Heatmap(
+        z=cm_norm,
+        x=NOMES_CLASSES,
+        y=NOMES_CLASSES,
+        colorscale="Blues",
+        text=[[f"{{cm[i, j]}}<br>({{cm_norm[i, j]*100:.1f}}%)" for j in range(len(NOMES_CLASSES))] for i in range(len(NOMES_CLASSES))],
+        texttemplate="%{{text}}",
+        textfont={{"size": 11}}
+    ))
+    fig.update_layout(
+        title=titulo,
+        xaxis_title="Classe Prevista",
+        yaxis_title="Classe Verdadeira",
+        template="plotly_white",
+        width=750, height=650
+    )
+    return fig
+
 fig_cm_hop = plotar_matriz_confusao(
     y_ref[idx_teste], y_pred_teste_hop,
     "{nome_cenario}: Matriz de Confusão — Teste Holdout Pós-Hopfield"
@@ -432,6 +543,30 @@ fig_cm_hop.show()
 """
     else:
         code_cm = f"""# 8.2 Matriz de Confusão Pós-Imputação Hopfield
+import plotly.graph_objects as go
+from sklearn.metrics import confusion_matrix
+
+def plotar_matriz_confusao(y_true, y_pred, titulo):
+    cm = confusion_matrix(y_true, y_pred, labels=np.arange(len(NOMES_CLASSES)))
+    cm_norm = cm.astype(float) / np.maximum(cm.sum(axis=1, keepdims=True), 1e-9)
+    fig = go.Figure(data=go.Heatmap(
+        z=cm_norm,
+        x=NOMES_CLASSES,
+        y=NOMES_CLASSES,
+        colorscale="Blues",
+        text=[[f"{{cm[i, j]}}<br>({{cm_norm[i, j]*100:.1f}}%)" for j in range(len(NOMES_CLASSES))] for i in range(len(NOMES_CLASSES))],
+        texttemplate="%{{text}}",
+        textfont={{"size": 11}}
+    ))
+    fig.update_layout(
+        title=titulo,
+        xaxis_title="Classe Prevista",
+        yaxis_title="Classe Verdadeira",
+        template="plotly_white",
+        width=750, height=650
+    )
+    return fig
+
 fig_cm_hop = plotar_matriz_confusao(
     y_alvo, y_pred_alvo_hop,
     "{nome_cenario}: Matriz de Confusão — Dataset Alvo Pós-Hopfield"
@@ -445,6 +580,9 @@ fig_cm_hop.show()
 
     # 5. Célula de Código: Gráfico Comparativo Triplo e Resumo de Métricas
     code_comp = f"""# 8.3 Comparativo de Desempenho Triplo (Limpo vs. Ruído 0,5 vs. Pós-Hopfield)
+import json
+import plotly.graph_objects as go
+
 rotulos_plot = ["Acurácia Global", "Macro F1", "Weighted F1"] + [f"F1 {{nome}}" for nome in NOMES_CLASSES]
 
 vals_limpo = [
@@ -547,11 +685,16 @@ print(f"Relatório comparativo salvo com sucesso em: {{path_json_final}}")
     with open(caminho_nb, "w", encoding="utf-8") as f:
         nbformat.write(nb, f)
 
-    # 7. Execução in-place das novas células via NotebookClient
-    print(f"[Notebook Client] Executando novas células em {caminho_nb.name}...")
+    # 7. Execução in-place exclusivamente das novas células via setup_kernel
+    print(f"[Notebook Client] Executando seletivamente as novas células em {caminho_nb.name}...")
     client = NotebookClient(nb, timeout=600, kernel_name="python3")
-    client.execute()
+    with client.setup_kernel():
+        for i in range(idx_inicio_novas, len(nb.cells)):
+            if nb.cells[i].cell_type == "code":
+                client.execute_cell(nb.cells[i], i)
+
     with open(caminho_nb, "w", encoding="utf-8") as f:
         nbformat.write(nb, f)
-    print(f"[Notebook Client] {caminho_nb.name} executado e atualizado com sucesso!")
+    print(f"[Notebook Client] {caminho_nb.name} atualizado e executado com sucesso!")
+
 
