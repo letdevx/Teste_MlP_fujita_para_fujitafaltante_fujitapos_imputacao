@@ -293,6 +293,11 @@ def imputar_e_projetar_sweep_streaming(
         partes_proj.append(res.proj.astype(np.float32))
 
         del bloco_entrada, prob_bloco, bloco_final, imputados, res
+        if (ini // chunk_size) % 5 == 0:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            cp.get_default_memory_pool().free_all_blocks()
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
