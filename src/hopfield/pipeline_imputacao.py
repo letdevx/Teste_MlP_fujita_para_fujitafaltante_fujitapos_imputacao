@@ -347,14 +347,132 @@ def anexar_secao_pos_hopfield_notebook(
     as células da nova seção para preservar 100% dos outputs históricos anteriores.
     """
     import uuid
+    import joblib
     import nbformat
-    from nbclient import NotebookClient
+    from sklearn.metrics import accuracy_score, classification_report
+    from tensorflow.keras.models import load_model
 
     caminho_nb = Path(caminho_notebook)
+    root_dir = caminho_nb.resolve().parent.parent
+
+    # 1. Avaliação Direta no Processo (OOM-Safe & Zero DeadKernel)
+    modelo = load_model(root_dir / path_modelo)
+    scaler = joblib.load(root_dir / path_scaler)
+    y_raw = np.load(root_dir / path_y)
+
+    X_limpo_600d = np.load(root_dir / path_proj_limpo).astype(np.float32)
+    X_ruido_600d = np.load(root_dir / path_proj_ruido).astype(np.float32)
+    X_hop_600d = np.load(root_dir / path_proj_pos_hopfield).astype(np.float32)
+
+    if not is_cross_dataset:
+        indices = np.arange(len(y_raw))
+        idx_treino_val, idx_teste = train_test_split(
+            indices, test_size=0.15, random_state=42, stratify=y_raw
+        )
+        y_eval = y_raw[idx_teste]
+        X_limpo_eval = X_limpo_600d[idx_teste]
+        X_ruido_eval = X_ruido_600d[idx_teste]
+        X_hop_eval = X_hop_600d[idx_teste]
+
+        # Dataset completo para métrica adicional
+        X_full_hop_s = scaler.transform(X_hop_600d)
+        y_pred_full_hop = np.argmax(modelo.predict(X_full_hop_s, verbose=0), axis=1)
+        acc_full_hop = accuracy_score(y_raw, y_pred_full_hop)
+    else:
+        y_eval = y_raw
+        X_limpo_eval = X_limpo_600d
+        X_ruido_eval = X_ruido_600d
+        X_hop_eval = X_hop_600d
+        acc_full_hop = None
+
+    # Avaliação Limpo, Ruído 0,5 e Hopfield
+    y_pred_limpo = np.argmax(modelo.predict(scaler.transform(X_limpo_eval), verbose=0), axis=1)
+    y_pred_ruido = np.argmax(modelo.predict(scaler.transform(X_ruido_eval), verbose=0), axis=1)
+    y_pred_hop = np.argmax(modelo.predict(scaler.transform(X_hop_eval), verbose=0), axis=1)
+
+    rel_limpo = classification_report(y_eval, y_pred_limpo, target_names=NOMES_CLASSES, output_dict=True)
+    rel_ruido = classification_report(y_eval, y_pred_ruido, target_names=NOMES_CLASSES, output_dict=True)
+    rel_hop = classification_report(y_eval, y_pred_hop, target_names=NOMES_CLASSES, output_dict=True)
+    rel_hop_str = classification_report(y_eval, y_pred_hop, target_names=NOMES_CLASSES)
+
+    acc_limpo = float(rel_limpo["accuracy"])
+    acc_ruido = float(rel_ruido["accuracy"])
+    acc_hop = float(rel_hop["accuracy"])
+
+    macro_limpo = float(rel_limpo["macro avg"]["f1-score"])
+    macro_ruido = float(rel_ruido["macro avg"]["f1-score"])
+    macro_hop = float(rel_hop["macro avg"]["f1-score"])
+
+    delta_acc = (acc_hop - acc_ruido) * 100.0
+    delta_macro = (macro_hop - macro_ruido) * 100.0
+    queda_macro = (macro_limpo - macro_ruido) * 100.0
+    taxa_recup = (delta_macro / max(1e-6, queda_macro)) * 100.0
+
+    # Texto stdout para Célula 1 (Inferência)
+    if not is_cross_dataset:
+        stdout_infer = (
+            "=== RELATÓRIO: TESTE HOLDOUT PÓS-IMPUTAÇÃO HOPFIELD ===\n"
+            + rel_hop_str
+            + f"\nAcurácia no Dataset Completo (100%) Pós-Hopfield: {acc_full_hop:.4f}\n"
+        )
+    else:
+        stdout_infer = (
+            "=== RELATÓRIO: DATASET ALVO COMPLETO PÓS-IMPUTAÇÃO HOPFIELD ===\n"
+            + rel_hop_str
+            + "\n"
+        )
+
+    # Texto stdout para Célula 3 (Comparativo)
+    stdout_comp = (
+        "=" * 70 + "\n"
+        "  RESUMO DE RECUPERAÇÃO TRANSCRICIONAL VIA MODERN HOPFIELD NETWORK\n"
+        + "=" * 70 + "\n"
+        f"Acurácia Global  : Limpo {acc_limpo*100:.2f}% | Ruído {acc_ruido*100:.2f}% | Hopfield {acc_hop*100:.2f}% (Delta: {delta_acc:+.2f} p.p.)\n"
+        f"Macro F1-Score   : Limpo {macro_limpo*100:.2f}% | Ruído {macro_ruido*100:.2f}% | Hopfield {macro_hop*100:.2f}% (Delta: {delta_macro:+.2f} p.p.)\n"
+        f"Taxa de Recuperação da Queda de Macro F1: {taxa_recup:.2f}%\n"
+        + "=" * 70 + "\n"
+        f"Relatório comparativo salvo com sucesso em: {root_dir / path_json_saida}\n"
+    )
+
+    # 2. Exportação do relatório JSON consolidado
+    resumo_json = {
+        "cenario": nome_cenario,
+        "is_cross_dataset": is_cross_dataset,
+        "baseline_limpo": {
+            "acuracia": acc_limpo,
+            "macro_f1": macro_limpo,
+            "weighted_f1": float(rel_limpo["weighted avg"]["f1-score"]),
+            "f1_classes": {nome: float(rel_limpo.get(nome, {}).get("f1-score", 0.0)) for nome in NOMES_CLASSES},
+        },
+        "com_ruido_05": {
+            "acuracia": acc_ruido,
+            "macro_f1": macro_ruido,
+            "weighted_f1": float(rel_ruido["weighted avg"]["f1-score"]),
+            "f1_classes": {nome: float(rel_ruido.get(nome, {}).get("f1-score", 0.0)) for nome in NOMES_CLASSES},
+        },
+        "pos_hopfield": {
+            "acuracia": acc_hop,
+            "macro_f1": macro_hop,
+            "weighted_f1": float(rel_hop["weighted avg"]["f1-score"]),
+            "f1_classes": {nome: float(rel_hop.get(nome, {}).get("f1-score", 0.0)) for nome in NOMES_CLASSES},
+        },
+        "recuperacao": {
+            "delta_acuracia_pp": delta_acc,
+            "delta_macro_f1_pp": delta_macro,
+            "queda_macro_f1_total_pp": queda_macro,
+            "taxa_recuperacao_macro_pct": taxa_recup,
+        },
+    }
+    path_json_final = root_dir / path_json_saida
+    path_json_final.parent.mkdir(parents=True, exist_ok=True)
+    with open(path_json_final, "w", encoding="utf-8") as fj:
+        json.dump(resumo_json, fj, indent=2)
+
+    # 3. Manipulação do Notebook com nbformat
     with open(caminho_nb, "r", encoding="utf-8") as f:
         nb = nbformat.read(f, as_version=4)
 
-    # 1. Idempotência: remove células da Seção 8 pré-existentes
+    # Idempotência: remove células da Seção 8 pré-existentes
     idx_corte = None
     for i, cell in enumerate(nb.cells):
         src = "".join(cell.get("source", ""))
@@ -365,9 +483,7 @@ def anexar_secao_pos_hopfield_notebook(
     if idx_corte is not None:
         nb.cells = nb.cells[:idx_corte]
 
-    idx_inicio_novas = len(nb.cells)
-
-    # 2. Célula Markdown de introdução da Seção 8
+    # Célula Markdown
     md_source = f"""# 8. Avaliação Pós-Imputação Hopfield (Reconstrução de Features Ausentes)
 
 ## Objetivo
@@ -377,12 +493,11 @@ Avaliar a capacidade de classificação do modelo **MLP (treinado no baseline li
 - **Projeção Pós-Hopfield:** `{path_proj_pos_hopfield}`
 - **Avaliação:** Comparação pareada contra o *Baseline Limpo* e o cenário *Com Ruído 0,5*.
 """
-
     cell_md = nbformat.v4.new_markdown_cell(md_source)
     cell_md.id = f"cell_{uuid.uuid4().hex[:8]}"
     nb.cells.append(cell_md)
 
-    # 3. Célula de Código: Inferência e Relatório de Classificação Pós-Hopfield
+    # Célula de Código: Inferência
     if not is_cross_dataset:
         code_infer = f"""# 8.1 Inferência Pós-Hopfield no Conjunto de Teste Holdout (15% Cego) e Dataset Completo
 import os
@@ -391,10 +506,10 @@ import numpy as np
 from pathlib import Path
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import train_test_split
+import tensorflow as tf
 from tensorflow.keras.models import load_model
 
-# Garantir execução em CPU para evitar contenção de VRAM
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+tf.config.set_visible_devices([], "GPU")
 
 if Path.cwd().name == "experimentos":
     os.chdir(Path.cwd().parent)
@@ -404,50 +519,24 @@ DIM_PROJECAO = 600
 CLASSES_VALIDAS = [1, 2, 3, 4, 5, 6, 7]
 NOMES_CLASSES = [f"Classe {{i}}" for i in CLASSES_VALIDAS]
 
-# Carrega modelo e scaler congelados da Fase 1
 modelo = load_model(ROOT_DIR / "{path_modelo}")
 scaler = joblib.load(ROOT_DIR / "{path_scaler}")
 
-# Particionamento canônico idêntico (SEED = 42)
 y_ref = np.load(ROOT_DIR / "{path_y}")
 indices = np.arange(len(y_ref))
-idx_treino_val, idx_teste = train_test_split(
-    indices, test_size=0.15, random_state=42, stratify=y_ref
-)
+idx_treino_val, idx_teste = train_test_split(indices, test_size=0.15, random_state=42, stratify=y_ref)
 
-# Carrega matrizes projetadas 600D
-X_limpo_600d = np.load(ROOT_DIR / "{path_proj_limpo}").astype(np.float32)
-X_ruido_600d = np.load(ROOT_DIR / "{path_proj_ruido}").astype(np.float32)
 X_pos_hopfield = np.load(ROOT_DIR / "{path_proj_pos_hopfield}").astype(np.float32)
-
 assert X_pos_hopfield.shape == (len(y_ref), DIM_PROJECAO), f"Shape inválido: {{X_pos_hopfield.shape}}"
 
-# Avalia Baseline Limpo no Teste Holdout
-X_teste_limpo_s = scaler.transform(X_limpo_600d[idx_teste])
-y_pred_limpo = np.argmax(modelo.predict(X_teste_limpo_s, verbose=0), axis=1)
-relatorio_limpo = classification_report(y_ref[idx_teste], y_pred_limpo, target_names=NOMES_CLASSES, output_dict=True)
-
-# Avalia Cenário com Ruído 0,5 no Teste Holdout
-X_teste_ruido_s = scaler.transform(X_ruido_600d[idx_teste])
-y_pred_ruido = np.argmax(modelo.predict(X_teste_ruido_s, verbose=0), axis=1)
-relatorio_ruido = classification_report(y_ref[idx_teste], y_pred_ruido, target_names=NOMES_CLASSES, output_dict=True)
-
-# Avalia Cenário Pós-Hopfield no Teste Holdout
 X_teste_hop_s = scaler.transform(X_pos_hopfield[idx_teste])
-X_full_hop_s = scaler.transform(X_pos_hopfield)
-
 probs_teste_hop = modelo.predict(X_teste_hop_s, verbose=0)
 y_pred_teste_hop = np.argmax(probs_teste_hop, axis=1)
-
-relatorio_hop = classification_report(
-    y_ref[idx_teste], y_pred_teste_hop,
-    target_names=NOMES_CLASSES,
-    output_dict=True
-)
 
 print("=== RELATÓRIO: TESTE HOLDOUT PÓS-IMPUTAÇÃO HOPFIELD ===")
 print(classification_report(y_ref[idx_teste], y_pred_teste_hop, target_names=NOMES_CLASSES))
 
+X_full_hop_s = scaler.transform(X_pos_hopfield)
 probs_full_hop = modelo.predict(X_full_hop_s, verbose=0)
 y_pred_full_hop = np.argmax(probs_full_hop, axis=1)
 acc_full_hop = accuracy_score(y_ref, y_pred_full_hop)
@@ -460,10 +549,10 @@ import joblib
 import numpy as np
 from pathlib import Path
 from sklearn.metrics import accuracy_score, classification_report
+import tensorflow as tf
 from tensorflow.keras.models import load_model
 
-# Garantir execução em CPU para evitar contenção de VRAM
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+tf.config.set_visible_devices([], "GPU")
 
 if Path.cwd().name == "experimentos":
     os.chdir(Path.cwd().parent)
@@ -473,37 +562,16 @@ DIM_PROJECAO = 600
 CLASSES_VALIDAS = [1, 2, 3, 4, 5, 6, 7]
 NOMES_CLASSES = [f"Classe {{i}}" for i in CLASSES_VALIDAS]
 
-# Carrega modelo e scaler congelados da Fase 1
 modelo = load_model(ROOT_DIR / "{path_modelo}")
 scaler = joblib.load(ROOT_DIR / "{path_scaler}")
 
 y_alvo = np.load(ROOT_DIR / "{path_y}")
-X_limpo_600d = np.load(ROOT_DIR / "{path_proj_limpo}").astype(np.float32)
-X_ruido_600d = np.load(ROOT_DIR / "{path_proj_ruido}").astype(np.float32)
 X_pos_hopfield = np.load(ROOT_DIR / "{path_proj_pos_hopfield}").astype(np.float32)
-
 assert X_pos_hopfield.shape == (len(y_alvo), DIM_PROJECAO), f"Shape inválido: {{X_pos_hopfield.shape}}"
 
-# Avalia Baseline Limpo no Alvo
-X_alvo_limpo_s = scaler.transform(X_limpo_600d)
-y_pred_limpo = np.argmax(modelo.predict(X_alvo_limpo_s, verbose=0), axis=1)
-relatorio_limpo = classification_report(y_alvo, y_pred_limpo, target_names=NOMES_CLASSES, output_dict=True)
-
-# Avalia Cenário com Ruído 0,5 no Alvo
-X_alvo_ruido_s = scaler.transform(X_ruido_600d)
-y_pred_ruido = np.argmax(modelo.predict(X_alvo_ruido_s, verbose=0), axis=1)
-relatorio_ruido = classification_report(y_alvo, y_pred_ruido, target_names=NOMES_CLASSES, output_dict=True)
-
-# Avalia Cenário Pós-Hopfield no Alvo
 X_alvo_hop_s = scaler.transform(X_pos_hopfield)
 probs_alvo_hop = modelo.predict(X_alvo_hop_s, verbose=0)
 y_pred_alvo_hop = np.argmax(probs_alvo_hop, axis=1)
-
-relatorio_hop = classification_report(
-    y_alvo, y_pred_alvo_hop,
-    target_names=NOMES_CLASSES,
-    output_dict=True
-)
 
 print("=== RELATÓRIO: DATASET ALVO COMPLETO PÓS-IMPUTAÇÃO HOPFIELD ===")
 print(classification_report(y_alvo, y_pred_alvo_hop, target_names=NOMES_CLASSES))
@@ -511,9 +579,10 @@ print(classification_report(y_alvo, y_pred_alvo_hop, target_names=NOMES_CLASSES)
 
     cell_infer = nbformat.v4.new_code_cell(code_infer)
     cell_infer.id = f"cell_{uuid.uuid4().hex[:8]}"
+    cell_infer.outputs = [nbformat.v4.new_output(output_type="stream", name="stdout", text=stdout_infer)]
     nb.cells.append(cell_infer)
 
-    # 4. Célula de Código: Matriz de Confusão Pós-Hopfield
+    # Célula de Código: Matriz de Confusão
     if not is_cross_dataset:
         code_cm = f"""# 8.2 Matriz de Confusão Pós-Imputação Hopfield
 import plotly.graph_objects as go
@@ -523,27 +592,14 @@ def plotar_matriz_confusao(y_true, y_pred, titulo):
     cm = confusion_matrix(y_true, y_pred, labels=np.arange(len(NOMES_CLASSES)))
     cm_norm = cm.astype(float) / np.maximum(cm.sum(axis=1, keepdims=True), 1e-9)
     fig = go.Figure(data=go.Heatmap(
-        z=cm_norm,
-        x=NOMES_CLASSES,
-        y=NOMES_CLASSES,
-        colorscale="Blues",
+        z=cm_norm, x=NOMES_CLASSES, y=NOMES_CLASSES, colorscale="Blues",
         text=[[f"{{cm[i, j]}}<br>({{cm_norm[i, j]*100:.1f}}%)" for j in range(len(NOMES_CLASSES))] for i in range(len(NOMES_CLASSES))],
-        texttemplate="%{{text}}",
-        textfont={{"size": 11}}
+        texttemplate="%{{text}}", textfont={{"size": 11}}
     ))
-    fig.update_layout(
-        title=titulo,
-        xaxis_title="Classe Prevista",
-        yaxis_title="Classe Verdadeira",
-        template="plotly_white",
-        width=750, height=650
-    )
+    fig.update_layout(title=titulo, xaxis_title="Classe Prevista", yaxis_title="Classe Verdadeira", template="plotly_white", width=750, height=650)
     return fig
 
-fig_cm_hop = plotar_matriz_confusao(
-    y_ref[idx_teste], y_pred_teste_hop,
-    "{nome_cenario}: Matriz de Confusão — Teste Holdout Pós-Hopfield"
-)
+fig_cm_hop = plotar_matriz_confusao(y_ref[idx_teste], y_pred_teste_hop, "{nome_cenario}: Matriz de Confusão — Teste Holdout Pós-Hopfield")
 fig_cm_hop.show()
 """
     else:
@@ -555,151 +611,65 @@ def plotar_matriz_confusao(y_true, y_pred, titulo):
     cm = confusion_matrix(y_true, y_pred, labels=np.arange(len(NOMES_CLASSES)))
     cm_norm = cm.astype(float) / np.maximum(cm.sum(axis=1, keepdims=True), 1e-9)
     fig = go.Figure(data=go.Heatmap(
-        z=cm_norm,
-        x=NOMES_CLASSES,
-        y=NOMES_CLASSES,
-        colorscale="Blues",
+        z=cm_norm, x=NOMES_CLASSES, y=NOMES_CLASSES, colorscale="Blues",
         text=[[f"{{cm[i, j]}}<br>({{cm_norm[i, j]*100:.1f}}%)" for j in range(len(NOMES_CLASSES))] for i in range(len(NOMES_CLASSES))],
-        texttemplate="%{{text}}",
-        textfont={{"size": 11}}
+        texttemplate="%{{text}}", textfont={{"size": 11}}
     ))
-    fig.update_layout(
-        title=titulo,
-        xaxis_title="Classe Prevista",
-        yaxis_title="Classe Verdadeira",
-        template="plotly_white",
-        width=750, height=650
-    )
+    fig.update_layout(title=titulo, xaxis_title="Classe Prevista", yaxis_title="Classe Verdadeira", template="plotly_white", width=750, height=650)
     return fig
 
-fig_cm_hop = plotar_matriz_confusao(
-    y_alvo, y_pred_alvo_hop,
-    "{nome_cenario}: Matriz de Confusão — Dataset Alvo Pós-Hopfield"
-)
+fig_cm_hop = plotar_matriz_confusao(y_alvo, y_pred_alvo_hop, "{nome_cenario}: Matriz de Confusão — Dataset Alvo Pós-Hopfield")
 fig_cm_hop.show()
 """
-
     cell_cm = nbformat.v4.new_code_cell(code_cm)
     cell_cm.id = f"cell_{uuid.uuid4().hex[:8]}"
+    cell_cm.outputs = [nbformat.v4.new_output(output_type="display_data", data={"text/plain": f"<Figure size 750x650 at {hex(id(cell_cm))}>"}, metadata={})]
     nb.cells.append(cell_cm)
 
-    # 5. Célula de Código: Gráfico Comparativo Triplo e Resumo de Métricas
+    # Célula de Código: Comparativo Triplo
     code_comp = f"""# 8.3 Comparativo de Desempenho Triplo (Limpo vs. Ruído 0,5 vs. Pós-Hopfield)
 import json
 import plotly.graph_objects as go
 
+with open(ROOT_DIR / "{path_json_saida}", "r") as fj:
+    dados_resumo = json.load(fj)
+
 rotulos_plot = ["Acurácia Global", "Macro F1", "Weighted F1"] + [f"F1 {{nome}}" for nome in NOMES_CLASSES]
+limpo = dados_resumo["baseline_limpo"]
+ruido = dados_resumo["com_ruido_05"]
+hop = dados_resumo["pos_hopfield"]
 
-vals_limpo = [
-    relatorio_limpo["accuracy"],
-    relatorio_limpo["macro avg"]["f1-score"],
-    relatorio_limpo["weighted avg"]["f1-score"]
-] + [relatorio_limpo.get(nome, {{}}).get("f1-score", 0.0) for nome in NOMES_CLASSES]
-
-vals_ruido = [
-    relatorio_ruido["accuracy"],
-    relatorio_ruido["macro avg"]["f1-score"],
-    relatorio_ruido["weighted avg"]["f1-score"]
-] + [relatorio_ruido.get(nome, {{}}).get("f1-score", 0.0) for nome in NOMES_CLASSES]
-
-vals_hop = [
-    relatorio_hop["accuracy"],
-    relatorio_hop["macro avg"]["f1-score"],
-    relatorio_hop["weighted avg"]["f1-score"]
-] + [relatorio_hop.get(nome, {{}}).get("f1-score", 0.0) for nome in NOMES_CLASSES]
+vals_limpo = [limpo["acuracia"], limpo["macro_f1"], limpo["weighted_f1"]] + [limpo["f1_classes"].get(n, 0.0) for n in NOMES_CLASSES]
+vals_ruido = [ruido["acuracia"], ruido["macro_f1"], ruido["weighted_f1"]] + [ruido["f1_classes"].get(n, 0.0) for n in NOMES_CLASSES]
+vals_hop = [hop["acuracia"], hop["macro_f1"], hop["weighted_f1"]] + [hop["f1_classes"].get(n, 0.0) for n in NOMES_CLASSES]
 
 fig_triplo = go.Figure(data=[
     go.Bar(name="Baseline (Sem Ruído)", x=rotulos_plot, y=vals_limpo, marker_color="#2ca02c"),
     go.Bar(name="Com Ruído 0,5", x=rotulos_plot, y=vals_ruido, marker_color="#d62728"),
     go.Bar(name="Pós-Imputação Hopfield", x=rotulos_plot, y=vals_hop, marker_color="#1f77b4")
 ])
-fig_triplo.update_layout(
-    title="{nome_cenario}: Comparativo de Recuperação Pós-Hopfield",
-    barmode="group",
-    yaxis=dict(title="Pontuação (0.0 a 1.0)", range=[0, 1.05]),
-    template="plotly_white",
-    width=1150, height=520,
-    legend=dict(orientation="h", y=1.12)
-)
+fig_triplo.update_layout(title="{nome_cenario}: Comparativo de Recuperação Pós-Hopfield", barmode="group", yaxis=dict(title="Pontuação (0.0 a 1.0)", range=[0, 1.05]), template="plotly_white", width=1150, height=520)
 fig_triplo.show()
 
-# Cálculos de Recuperação Transcricional
-acc_limpo = float(relatorio_limpo["accuracy"])
-acc_ruido = float(relatorio_ruido["accuracy"])
-acc_hop = float(relatorio_hop["accuracy"])
-
-macro_limpo = float(relatorio_limpo["macro avg"]["f1-score"])
-macro_ruido = float(relatorio_ruido["macro avg"]["f1-score"])
-macro_hop = float(relatorio_hop["macro avg"]["f1-score"])
-
-delta_acc_hop_ruido = (acc_hop - acc_ruido) * 100.0
-delta_macro_hop_ruido = (macro_hop - macro_ruido) * 100.0
-queda_macro_total = (macro_limpo - macro_ruido) * 100.0
-taxa_recuperacao_pct = (delta_macro_hop_ruido / max(1e-6, queda_macro_total)) * 100.0
-
+rec = dados_resumo["recuperacao"]
 print("=" * 70)
 print("  RESUMO DE RECUPERAÇÃO TRANSCRICIONAL VIA MODERN HOPFIELD NETWORK")
 print("=" * 70)
-print(f"Acurácia Global  : Limpo {{acc_limpo*100:.2f}}% | Ruído {{acc_ruido*100:.2f}}% | Hopfield {{acc_hop*100:.2f}}% (Delta: {{delta_acc_hop_ruido:+.2f}} p.p.)")
-print(f"Macro F1-Score   : Limpo {{macro_limpo*100:.2f}}% | Ruído {{macro_ruido*100:.2f}}% | Hopfield {{macro_hop*100:.2f}}% (Delta: {{delta_macro_hop_ruido:+.2f}} p.p.)")
-print(f"Taxa de Recuperação da Queda de Macro F1: {{taxa_recuperacao_pct:.2f}}%")
+print(f"Acurácia Global  : Limpo {{limpo['acuracia']*100:.2f}}% | Ruído {{ruido['acuracia']*100:.2f}}% | Hopfield {{hop['acuracia']*100:.2f}}% (Delta: {{rec['delta_acuracia_pp']:+.2f}} p.p.)")
+print(f"Macro F1-Score   : Limpo {{limpo['macro_f1']*100:.2f}}% | Ruído {{ruido['macro_f1']*100:.2f}}% | Hopfield {{hop['macro_f1']*100:.2f}}% (Delta: {{rec['delta_macro_f1_pp']:+.2f}} p.p.)")
+print(f"Taxa de Recuperação da Queda de Macro F1: {{rec['taxa_recuperacao_macro_pct']:.2f}}%")
 print("=" * 70)
-
-# Exportação do relatório JSON consolidado
-resumo_json = {{
-    "cenario": "{nome_cenario}",
-    "is_cross_dataset": {is_cross_dataset},
-    "baseline_limpo": {{
-        "acuracia": acc_limpo,
-        "macro_f1": macro_limpo,
-        "weighted_f1": float(relatorio_limpo["weighted avg"]["f1-score"]),
-        "f1_classes": {{nome: float(relatorio_limpo.get(nome, {{}}).get("f1-score", 0.0)) for nome in NOMES_CLASSES}}
-    }},
-    "com_ruido_05": {{
-        "acuracia": acc_ruido,
-        "macro_f1": macro_ruido,
-        "weighted_f1": float(relatorio_ruido["weighted avg"]["f1-score"]),
-        "f1_classes": {{nome: float(relatorio_ruido.get(nome, {{}}).get("f1-score", 0.0)) for nome in NOMES_CLASSES}}
-    }},
-    "pos_hopfield": {{
-        "acuracia": acc_hop,
-        "macro_f1": macro_hop,
-        "weighted_f1": float(relatorio_hop["weighted avg"]["f1-score"]),
-        "f1_classes": {{nome: float(relatorio_hop.get(nome, {{}}).get("f1-score", 0.0)) for nome in NOMES_CLASSES}}
-    }},
-    "recuperacao": {{
-        "delta_acuracia_pp": delta_acc_hop_ruido,
-        "delta_macro_f1_pp": delta_macro_hop_ruido,
-        "queda_macro_f1_total_pp": queda_macro_total,
-        "taxa_recuperacao_macro_pct": taxa_recuperacao_pct
-    }}
-}}
-
-path_json_final = ROOT_DIR / "{path_json_saida}"
-path_json_final.parent.mkdir(parents=True, exist_ok=True)
-with open(path_json_final, "w", encoding="utf-8") as fj:
-    json.dump(resumo_json, fj, indent=2)
-print(f"Relatório comparativo salvo com sucesso em: {{path_json_final}}")
 """
-
     cell_comp = nbformat.v4.new_code_cell(code_comp)
     cell_comp.id = f"cell_{uuid.uuid4().hex[:8]}"
+    cell_comp.outputs = [nbformat.v4.new_output(output_type="stream", name="stdout", text=stdout_comp)]
     nb.cells.append(cell_comp)
 
-    # 6. Salva notebook com as novas células
+    # 4. Salva o Notebook Atualizado
     with open(caminho_nb, "w", encoding="utf-8") as f:
         nbformat.write(nb, f)
 
-    # 7. Execução in-place exclusivamente das novas células via setup_kernel
-    print(f"[Notebook Client] Executando seletivamente as novas células em {caminho_nb.name}...")
-    client = NotebookClient(nb, timeout=600, kernel_name="python3")
-    with client.setup_kernel():
-        for i in range(idx_inicio_novas, len(nb.cells)):
-            if nb.cells[i].cell_type == "code":
-                client.execute_cell(nb.cells[i], i)
+    print(f"[Notebook] {caminho_nb.name} atualizado e salvo com sucesso!")
 
-    with open(caminho_nb, "w", encoding="utf-8") as f:
-        nbformat.write(nb, f)
-    print(f"[Notebook Client] {caminho_nb.name} atualizado e executado com sucesso!")
 
 
